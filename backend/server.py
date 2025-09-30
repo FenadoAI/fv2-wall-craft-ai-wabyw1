@@ -49,6 +49,9 @@ class Wallpaper(BaseModel):
 
 async def generate_image_with_mcp(prompt: str) -> str:
     """Generate image using CodexHub MCP Image Generation service"""
+    if not CODEXHUB_MCP_AUTH_TOKEN:
+        raise Exception("CODEXHUB_MCP_AUTH_TOKEN is not configured. Please add your token to backend/.env file.")
+
     try:
         async with httpx.AsyncClient(timeout=120.0) as client:
             # Call CodexHub MCP Image Generation endpoint
