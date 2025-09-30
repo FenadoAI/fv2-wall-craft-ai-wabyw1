@@ -14,7 +14,7 @@ from motor.motor_asyncio import AsyncIOMotorClient
 from pydantic import BaseModel, Field
 from starlette.middleware.cors import CORSMiddleware
 
-from ai_agents.agents import AgentConfig, ChatAgent, SearchAgent
+from ai_agents import AgentConfig, ChatAgent, SearchAgent, ImageAgent
 
 
 logging.basicConfig(
@@ -65,6 +65,31 @@ class SearchResponse(BaseModel):
     error: Optional[str] = None
 
 
+class Wallpaper(BaseModel):
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    prompt: str
+    image_url: str
+    image_data: str
+    likes: int = 0
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+
+class WallpaperCreate(BaseModel):
+    prompt: str
+
+
+class WallpaperResponse(BaseModel):
+    success: bool
+    wallpaper: Optional[dict] = None
+    error: Optional[str] = None
+
+
+class LikeWallpaperResponse(BaseModel):
+    success: bool
+    likes: int
+    error: Optional[str] = None
+
+
 def _ensure_db(request: Request):
     try:
         return request.app.state.db
@@ -89,10 +114,25 @@ async def _get_or_create_agent(request: Request, agent_type: str):
         cache[agent_type] = SearchAgent(config)
     elif agent_type == "chat":
         cache[agent_type] = ChatAgent(config)
+    elif agent_type == "image":
+        cache[agent_type] = ImageAgent(config)
     else:
         raise HTTPException(status_code=400, detail=f"Unknown agent type '{agent_type}'")
 
     return cache[agent_type]
+
+
+async def _check_rate_limit(request: Request, client_ip: str) -> bool:
+    """Check if IP has exceeded 5 generations per day"""
+    db = _ensure_db(request)
+    today_start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+
+    count = await db.wallpapers.count_documents({
+        "ip_address": client_ip,
+        "created_at": {"$gte": today_start}
+    })
+
+    return count < 5
 
 
 @asynccontextmanager
@@ -233,6 +273,140 @@ async def get_agent_capabilities(request: Request):
         raise
     except Exception as exc:  # pragma: no cover - defensive
         logger.exception("Error getting capabilities")
+        return {"success": False, "error": str(exc)}
+
+
+@api_router.post("/wallpapers/generate", response_model=WallpaperResponse)
+async def generate_wallpaper(wallpaper_create: WallpaperCreate, request: Request):
+    """Generate a wallpaper using AI image generation"""
+    try:
+        client_ip = request.client.host if request.client else "unknown"
+
+        # Check rate limit
+        if not await _check_rate_limit(request, client_ip):
+            raise HTTPException(
+                status_code=429,
+                detail="Daily generation limit (5) reached. Try again tomorrow."
+            )
+
+        # Generate image using ImageAgent
+        image_agent = await _get_or_create_agent(request, "image")
+        result = await image_agent.execute(
+            f"Create a beautiful wallpaper: {wallpaper_create.prompt}",
+            use_tools=True
+        )
+
+        if not result.success:
+            return WallpaperResponse(success=False, error=result.error or "Failed to generate image")
+
+        # Extract image data from metadata
+        image_url = result.metadata.get("image_url", "")
+        image_data = result.metadata.get("image_data", "")
+
+        if not image_url or not image_data:
+            return WallpaperResponse(success=False, error="No image data returned")
+
+        # Save to database
+        db = _ensure_db(request)
+        wallpaper = Wallpaper(
+            prompt=wallpaper_create.prompt,
+            image_url=image_url,
+            image_data=image_data
+        )
+
+        wallpaper_dict = wallpaper.model_dump()
+        wallpaper_dict["ip_address"] = client_ip
+        await db.wallpapers.insert_one(wallpaper_dict)
+
+        return WallpaperResponse(success=True, wallpaper=wallpaper.model_dump())
+
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("Error generating wallpaper")
+        return WallpaperResponse(success=False, error=str(exc))
+
+
+@api_router.get("/wallpapers/top")
+async def get_top_wallpapers(request: Request):
+    """Get top 5 most liked wallpapers"""
+    try:
+        db = _ensure_db(request)
+        wallpapers = await db.wallpapers.find().sort("likes", -1).limit(5).to_list(5)
+
+        # Remove IP address from response
+        for wallpaper in wallpapers:
+            wallpaper.pop("ip_address", None)
+            wallpaper["_id"] = str(wallpaper.get("_id", ""))
+
+        return {"success": True, "wallpapers": wallpapers}
+    except Exception as exc:
+        logger.exception("Error fetching top wallpapers")
+        return {"success": False, "error": str(exc)}
+
+
+@api_router.post("/wallpapers/{wallpaper_id}/like", response_model=LikeWallpaperResponse)
+async def like_wallpaper(wallpaper_id: str, request: Request):
+    """Increment likes for a wallpaper"""
+    try:
+        db = _ensure_db(request)
+        result = await db.wallpapers.update_one(
+            {"id": wallpaper_id},
+            {"$inc": {"likes": 1}}
+        )
+
+        if result.matched_count == 0:
+            raise HTTPException(status_code=404, detail="Wallpaper not found")
+
+        wallpaper = await db.wallpapers.find_one({"id": wallpaper_id})
+        return LikeWallpaperResponse(success=True, likes=wallpaper["likes"])
+
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("Error liking wallpaper")
+        return LikeWallpaperResponse(success=False, likes=0, error=str(exc))
+
+
+@api_router.get("/wallpapers/{wallpaper_id}")
+async def get_wallpaper(wallpaper_id: str, request: Request):
+    """Get a specific wallpaper by ID"""
+    try:
+        db = _ensure_db(request)
+        wallpaper = await db.wallpapers.find_one({"id": wallpaper_id})
+
+        if not wallpaper:
+            raise HTTPException(status_code=404, detail="Wallpaper not found")
+
+        wallpaper.pop("ip_address", None)
+        wallpaper["_id"] = str(wallpaper.get("_id", ""))
+
+        return {"success": True, "wallpaper": wallpaper}
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("Error fetching wallpaper")
+        return {"success": False, "error": str(exc)}
+
+
+@api_router.get("/wallpapers/limit/check")
+async def check_rate_limit(request: Request):
+    """Check remaining generations for today"""
+    try:
+        client_ip = request.client.host if request.client else "unknown"
+        db = _ensure_db(request)
+        today_start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+
+        count = await db.wallpapers.count_documents({
+            "ip_address": client_ip,
+            "created_at": {"$gte": today_start}
+        })
+
+        remaining = max(0, 5 - count)
+        return {"success": True, "used": count, "remaining": remaining, "limit": 5}
+
+    except Exception as exc:
+        logger.exception("Error checking rate limit")
         return {"success": False, "error": str(exc)}
 
 
