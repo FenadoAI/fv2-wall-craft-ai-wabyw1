@@ -8,6 +8,7 @@ import os
 import uuid
 from dotenv import load_dotenv
 import httpx
+from ai_agents import ImageAgent, AgentConfig
 
 load_dotenv()
 
@@ -48,40 +49,36 @@ class Wallpaper(BaseModel):
     created_at: datetime = Field(default_factory=datetime.utcnow)
 
 async def generate_image_with_mcp(prompt: str) -> str:
-    """Generate image using CodexHub MCP Image Generation service"""
+    """Generate image using ImageAgent with MCP"""
     if not CODEXHUB_MCP_AUTH_TOKEN:
         raise Exception("CODEXHUB_MCP_AUTH_TOKEN is not configured. Please add your token to backend/.env file.")
 
     try:
+        # Use ImageAgent to generate image
+        config = AgentConfig()
+        agent = ImageAgent(config)
+
+        # Generate image with structured output
+        result = await agent.generate_image_structured(f"Generate a beautiful high-quality wallpaper image: {prompt}")
+
+        if not result.success or not result.image_url:
+            raise Exception(f"Image generation failed: {result.description}")
+
+        # Fetch the image and convert to base64
         async with httpx.AsyncClient(timeout=120.0) as client:
-            # Call CodexHub MCP Image Generation endpoint
-            response = await client.post(
-                "https://mcp.codexhub.ai/image/generate",
-                json={
-                    "prompt": prompt,
-                    "aspect_ratio": "16:9",  # Good for wallpapers
-                    "megapixels": "1",
-                    "output_format": "png"
-                },
-                headers={
-                    "Authorization": f"Bearer {CODEXHUB_MCP_AUTH_TOKEN}",
-                    "Content-Type": "application/json"
-                }
-            )
-
-            if response.status_code == 200:
-                result = response.json()
-                # The MCP returns a URL, we need to fetch and convert to base64
-                image_url = result.get("url")
-                if image_url:
-                    # Fetch the image
-                    img_response = await client.get(image_url)
-                    if img_response.status_code == 200:
-                        import base64
-                        image_base64 = base64.b64encode(img_response.content).decode('utf-8')
-                        return f"data:image/png;base64,{image_base64}"
-
-            raise Exception(f"Image generation failed: {response.status_code} - {response.text}")
+            img_response = await client.get(result.image_url)
+            if img_response.status_code == 200:
+                import base64
+                image_base64 = base64.b64encode(img_response.content).decode('utf-8')
+                # Determine format from URL
+                format_ext = "png"
+                if ".webp" in result.image_url:
+                    format_ext = "webp"
+                elif ".jpg" in result.image_url or ".jpeg" in result.image_url:
+                    format_ext = "jpeg"
+                return f"data:image/{format_ext};base64,{image_base64}"
+            else:
+                raise Exception(f"Failed to fetch image from URL: {img_response.status_code}")
 
     except Exception as e:
         print(f"Error generating image: {str(e)}")
